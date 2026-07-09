@@ -11,7 +11,7 @@ Blender 4.2 이상에서:
 2. URL에 아래 주소 입력:
 
    ```
-   https://raw.githubusercontent.com/<GITHUB_USER>/<REPO>/main/index.json
+   https://raw.githubusercontent.com/ODZSTUDIO/camera-orbit-rig/main/index.json
    ```
 
 3. `Check for Updates on Startup`를 켜면 새 버전이 올라올 때 블렌더가 자동으로 알려준다.
