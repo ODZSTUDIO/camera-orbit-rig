@@ -1,0 +1,28 @@
+{
+    "version":  "v1",
+    "blocklist":  [
+
+                  ],
+    "data":  [
+                 {
+                     "schema_version":  "1.0.0",
+                     "id":  "camera_orbit_rig",
+                     "name":  "Camera Orbit Rig",
+                     "tagline":  "Orbit camera rig with bank, tilt, distance and focus controls",
+                     "version":  "1.0.0",
+                     "type":  "add-on",
+                     "maintainer":  "YOON \u003cjeayoun9190@gmail.com\u003e",
+                     "license":  [
+                                     "SPDX:GPL-3.0-or-later"
+                                 ],
+                     "blender_version_min":  "4.2.0",
+                     "tags":  [
+                                  "Camera",
+                                  "3D View"
+                              ],
+                     "archive_url":  "./camera_orbit_rig-1.0.0.zip",
+                     "archive_size":  2987,
+                     "archive_hash":  "sha256:497f5c5522d39fee6bb5fb41a6689accf86f6c5c10f1d3813e3c9fed0cc869b3"
+                 }
+             ]
+}
