@@ -38,9 +38,18 @@ Blender 4.2 이상에서:
 ## 리그 구조
 
 ```
-CamRig_Root (Empty, 중심점)   ← Orbit: Z축 회전
- └ CamRig_Pivot (Empty)      ← Tilt: 상하 각도
-    └ CamRig_Camera          ← Distance: 중심점과의 거리, Bank: 뷰 축 롤
+CamRig_Root (Empty, 중심점)   ← G: 중심점 이동 / R: Orbit / S: Distance 배율
+ └ CamRig_Pivot (Empty)      ← R: Tilt
+    └ CamRig_Camera          ← G: Distance / R: Bank
 ```
 
-슬라이더 값은 Root의 커스텀 프로퍼티에 드라이버로 연결되어 있어 키프레임 애니메이션이 가능하다.
+## 뷰포트 조작 (v1.1.0+)
+
+슬라이더가 오브젝트 트랜스폼을 직접 읽고 쓰기 때문에 뷰포트에서 G/R/S로
+움직이면 N 패널 슬라이더에 그대로 반영되고, 반대도 마찬가지다.
+리그에 필요 없는 축은 잠겨 있어서 G/R/S가 정확히 해당 컨트롤만 움직인다.
+
+- 애니메이션: 오브젝트 트랜스폼에 키프레임을 넣거나, N 패널의 **Keyframe Rig**(열쇠 아이콘)
+  버튼으로 현재 프레임에 리그 전체 키프레임을 한 번에 삽입
+- **Reset Aim**: 카메라 조준이 틀어졌을 때 중심점을 다시 바라보게 정리 (Bank는 유지)
+- v1.0.0에서 만든 리그를 선택하면 패널에 **Upgrade Rig** 버튼이 표시된다
