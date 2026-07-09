@@ -3,23 +3,30 @@
 
 import math
 import bpy
-from bpy.props import FloatProperty, PointerProperty
+from bpy.props import FloatProperty, PointerProperty, StringProperty
 
 
 # -----------------------------------------------------------------------------
 # 리그 구조
-#   Root (Empty, 중심점)  - Orbit(Z 회전), 이동(G), 스케일(S)=Distance 배율
-#     └ Pivot (Empty)     - Tilt(X 회전)
-#         └ Camera        - Distance(-Y 위치), Bank(뷰 축 롤)
+#   Root (Empty, 중심점/마스터)  - Orbit(Z 회전), 이동(G), 스케일(S)=Distance 배율
+#     ├ OrbitPath (Curve)       - 카메라 궤도 시각 표시 (선택 불가, 드라이버로 자동 갱신)
+#     ├ Target (Empty)          - 카메라 조준점. G로 옮기면 카메라가 따라봄 (Damped Track)
+#     ├ Focus (Empty)           - DOF 초점 오브젝트. G로 옮기면 초점이 따라감
+#     └ Pivot (Empty)           - Tilt(X 회전)
+#         └ Camera              - Distance(-Y 위치), Bank(뷰 축 롤)
 #
 # 슬라이더는 오브젝트 트랜스폼을 직접 읽고 쓴다(get/set 프로퍼티).
 # 그래서 뷰포트에서 G/R/S로 움직여도 슬라이더에 그대로 반영되고, 반대도 마찬가지.
 # 리그에 필요 없는 축은 잠가 두어 G/R/S가 정확히 해당 컨트롤만 움직인다.
-# 애니메이션은 오브젝트 트랜스폼에 키프레임을 넣으면 된다 (Keyframe Rig 버튼 참고).
+# Damped Track은 Track To와 달리 롤을 보존해서 Bank가 그대로 동작한다.
 # -----------------------------------------------------------------------------
 
 ROOT_MARKER = "is_camrig_root"
-RIG_VERSION = 2  # 1: 구버전(드라이버 방식), 2: 트랜스폼 직접 제어 방식
+RIG_VERSION = 3  # 1: 드라이버 방식, 2: 트랜스폼 직접 제어, 3: Target/Focus/궤도 추가
+PART_PROP = "camrig_part"
+TRACK_CON_NAME = "CamRig Track"
+
+BEZIER_CIRCLE_C = 0.5522847498  # 반지름 1 원의 베지어 핸들 길이
 
 
 def get_rig_root(obj):
@@ -31,14 +38,20 @@ def get_rig_root(obj):
     return None
 
 
+def find_part(root, part):
+    return next((c for c in root.children_recursive if c.get(PART_PROP) == part), None)
+
+
 def get_rig_objects(root):
     """(pivot, camera) 반환. 없으면 None"""
-    pivot = next((c for c in root.children if c.type == 'EMPTY'), None)
-    cam = next((c for c in root.children_recursive if c.type == 'CAMERA'), None)
+    cam = find_part(root, "camera")
+    if cam is None:
+        cam = next((c for c in root.children_recursive if c.type == 'CAMERA'), None)
+    pivot = cam.parent if cam else None
     return pivot, cam
 
 
-def apply_rig_locks(root, pivot, cam):
+def apply_rig_locks(root, pivot, cam, target=None, focus=None):
     """G/R/S가 리그 컨트롤만 움직이도록 불필요한 축 잠금"""
     # Root: G 이동, R = Orbit(Z만), S = Distance 배율
     root.lock_rotation = (True, True, False)
@@ -50,6 +63,11 @@ def apply_rig_locks(root, pivot, cam):
     cam.lock_location = (True, False, True)
     cam.lock_rotation = (True, True, False)
     cam.lock_scale = (True, True, True)
+    # Target/Focus: G 이동만
+    for obj in (target, focus):
+        if obj:
+            obj.lock_rotation = (True, True, True)
+            obj.lock_scale = (True, True, True)
 
 
 def _avg_scale(obj):
@@ -117,6 +135,100 @@ class CamRigSettings(bpy.types.PropertyGroup):
         get=_get_distance, set=_set_distance, min=0.0, soft_max=100.0)
 
 
+# --- 리그 부품 생성 -----------------------------------------------------------
+
+def make_orbit_path_curve(name):
+    """반지름 1짜리 베지어 원 커브 데이터 생성"""
+    curve = bpy.data.curves.new(name, 'CURVE')
+    curve.dimensions = '3D'
+    spline = curve.splines.new('BEZIER')
+    spline.bezier_points.add(3)
+    c = BEZIER_CIRCLE_C
+    # (좌표, 왼쪽 핸들, 오른쪽 핸들) — 반시계 방향
+    points = (
+        ((1, 0, 0), (1, -c, 0), (1, c, 0)),
+        ((0, 1, 0), (c, 1, 0), (-c, 1, 0)),
+        ((-1, 0, 0), (-1, c, 0), (-1, -c, 0)),
+        ((0, -1, 0), (-c, -1, 0), (c, -1, 0)),
+    )
+    for bp, (co, hl, hr) in zip(spline.bezier_points, points):
+        bp.co = co
+        bp.handle_left = hl
+        bp.handle_right = hr
+        bp.handle_left_type = 'FREE'
+        bp.handle_right_type = 'FREE'
+    spline.use_cyclic_u = True
+    return curve
+
+
+def add_orbit_path_drivers(path, pivot, cam):
+    """궤도 원이 카메라 거리/틸트를 따라가도록 드라이버 연결 (시각 표시 전용)"""
+
+    def make_driver(fcurve, expression):
+        driver = fcurve.driver
+        driver.type = 'SCRIPTED'
+        v = driver.variables.new()
+        v.name = "cy"
+        v.type = 'TRANSFORMS'
+        v.targets[0].id = cam
+        v.targets[0].transform_type = 'LOC_Y'
+        v.targets[0].transform_space = 'TRANSFORM_SPACE'
+        v = driver.variables.new()
+        v.name = "px"
+        v.type = 'TRANSFORMS'
+        v.targets[0].id = pivot
+        v.targets[0].transform_type = 'ROT_X'
+        v.targets[0].transform_space = 'TRANSFORM_SPACE'
+        driver.expression = expression
+
+    for i in range(3):
+        make_driver(path.driver_add("scale", i), "-cy * cos(px)")
+    make_driver(path.driver_add("location", 2), "cy * sin(px)")
+
+
+def add_rig_extras(context, root, pivot, cam):
+    """Target / Focus / 궤도 원 생성 및 연결 (v3 파트)"""
+    collection = context.collection
+
+    # Target: 카메라 조준점
+    target = bpy.data.objects.new("CamRig_Target", None)
+    target.empty_display_type = 'PLAIN_AXES'
+    target.empty_display_size = 0.25
+    target.parent = root
+    target[PART_PROP] = "target"
+    collection.objects.link(target)
+
+    # Focus: DOF 초점
+    focus = bpy.data.objects.new("CamRig_Focus", None)
+    focus.empty_display_type = 'SPHERE'
+    focus.empty_display_size = 0.15
+    focus.parent = root
+    focus[PART_PROP] = "focus"
+    collection.objects.link(focus)
+
+    # OrbitPath: 시각 표시 전용 궤도 원
+    path = bpy.data.objects.new("CamRig_OrbitPath", make_orbit_path_curve("CamRig_OrbitPath"))
+    path.parent = root
+    path[PART_PROP] = "path"
+    path.hide_select = True
+    path.hide_render = True
+    collection.objects.link(path)
+    add_orbit_path_drivers(path, pivot, cam)
+
+    # Damped Track: 롤(Bank)을 보존하면서 Target을 바라봄
+    con = cam.constraints.new('DAMPED_TRACK')
+    con.name = TRACK_CON_NAME
+    con.target = target
+    con.track_axis = 'TRACK_NEGATIVE_Z'
+
+    # DOF 초점을 Focus 엠프티로
+    cam.data.dof.focus_object = focus
+
+    cam[PART_PROP] = "camera"
+    pivot[PART_PROP] = "pivot"
+    return target, focus, path
+
+
 # --- 오퍼레이터 ---------------------------------------------------------------
 
 class CAMRIG_OT_add(bpy.types.Operator):
@@ -129,10 +241,10 @@ class CAMRIG_OT_add(bpy.types.Operator):
         cursor = context.scene.cursor.location.copy()
         collection = context.collection
 
-        # Root: 중심점
+        # Root: 중심점/마스터
         root = bpy.data.objects.new("CamRig_Root", None)
-        root.empty_display_type = 'PLAIN_AXES'
-        root.empty_display_size = 0.5
+        root.empty_display_type = 'SPHERE'
+        root.empty_display_size = 0.35
         root.location = cursor
         collection.objects.link(root)
 
@@ -154,8 +266,10 @@ class CAMRIG_OT_add(bpy.types.Operator):
         cam.rotation_euler = (math.radians(90.0), 0.0, 0.0)
         collection.objects.link(cam)
 
+        target, focus, _ = add_rig_extras(context, root, pivot, cam)
+
         root[ROOT_MARKER] = RIG_VERSION
-        apply_rig_locks(root, pivot, cam)
+        apply_rig_locks(root, pivot, cam, target, focus)
 
         # 씬 카메라로 지정하고 루트 선택
         context.scene.camera = cam
@@ -169,7 +283,7 @@ class CAMRIG_OT_add(bpy.types.Operator):
 
 
 class CAMRIG_OT_upgrade(bpy.types.Operator):
-    """구버전(드라이버 방식) 리그를 뷰포트 직접 제어 방식으로 변환"""
+    """구버전 리그를 최신 구조(Target/Focus/궤도 표시)로 변환"""
     bl_idname = "camrig.upgrade"
     bl_label = "Upgrade Rig"
     bl_options = {'REGISTER', 'UNDO'}
@@ -183,27 +297,35 @@ class CAMRIG_OT_upgrade(bpy.types.Operator):
             self.report({'WARNING'}, "리그 구조를 찾을 수 없습니다")
             return {'CANCELLED'}
 
-        orbit = float(root.get("orbit", 0.0))
-        tilt = float(root.get("tilt", 20.0))
-        bank = float(root.get("bank", 0.0))
-        distance = float(root.get("distance", 5.0))
+        # v1: 드라이버 방식 → 값을 트랜스폼으로 옮기고 드라이버 제거
+        if "orbit" in root.keys():
+            orbit = float(root.get("orbit", 0.0))
+            tilt = float(root.get("tilt", 20.0))
+            bank = float(root.get("bank", 0.0))
+            distance = float(root.get("distance", 5.0))
 
-        root.driver_remove("rotation_euler", 2)
-        pivot.driver_remove("rotation_euler", 0)
-        cam.driver_remove("location", 1)
-        cam.driver_remove("rotation_euler", 2)
+            root.driver_remove("rotation_euler", 2)
+            pivot.driver_remove("rotation_euler", 0)
+            cam.driver_remove("location", 1)
+            cam.driver_remove("rotation_euler", 2)
 
-        root.rotation_euler.z = math.radians(orbit)
-        pivot.rotation_euler.x = -math.radians(tilt)
-        cam.location.y = -distance
-        cam.rotation_euler.z = math.radians(bank)
+            root.rotation_euler.z = math.radians(orbit)
+            pivot.rotation_euler.x = -math.radians(tilt)
+            cam.location.y = -distance
+            cam.rotation_euler.z = math.radians(bank)
 
-        for key in ("orbit", "tilt", "bank", "distance"):
-            if key in root.keys():
-                del root[key]
+            for key in ("orbit", "tilt", "bank", "distance"):
+                if key in root.keys():
+                    del root[key]
+
+        # v2 → v3: Target / Focus / 궤도 원 추가
+        target = find_part(root, "target")
+        focus = find_part(root, "focus")
+        if target is None or focus is None:
+            target, focus, _ = add_rig_extras(context, root, pivot, cam)
 
         root[ROOT_MARKER] = RIG_VERSION
-        apply_rig_locks(root, pivot, cam)
+        apply_rig_locks(root, pivot, cam, target, focus)
 
         self.report({'INFO'}, "리그 업그레이드 완료")
         return {'FINISHED'}
@@ -229,7 +351,7 @@ class CAMRIG_OT_look_through(bpy.types.Operator):
 
 
 class CAMRIG_OT_keyframe(bpy.types.Operator):
-    """현재 프레임에 리그 전체(Orbit/Tilt/Bank/Distance/중심점) 키프레임 삽입"""
+    """현재 프레임에 리그 전체(Orbit/Tilt/Bank/Distance/중심점/Target/Focus) 키프레임 삽입"""
     bl_idname = "camrig.keyframe"
     bl_label = "Keyframe Rig"
     bl_options = {'REGISTER', 'UNDO'}
@@ -247,12 +369,16 @@ class CAMRIG_OT_keyframe(bpy.types.Operator):
         if cam:
             cam.keyframe_insert("location", index=1)
             cam.keyframe_insert("rotation_euler", index=2)
+        for part in ("target", "focus"):
+            obj = find_part(root, part)
+            if obj:
+                obj.keyframe_insert("location")
         self.report({'INFO'}, "리그 키프레임 삽입 완료")
         return {'FINISHED'}
 
 
 class CAMRIG_OT_reset_aim(bpy.types.Operator):
-    """카메라가 다시 중심점을 바라보도록 잠기지 않은 축을 정리 (Bank는 유지)"""
+    """Target을 중심점으로 되돌리고 카메라 조준 축을 정리 (Bank는 유지)"""
     bl_idname = "camrig.reset_aim"
     bl_label = "Reset Aim"
     bl_options = {'REGISTER', 'UNDO'}
@@ -272,6 +398,39 @@ class CAMRIG_OT_reset_aim(bpy.types.Operator):
             cam.rotation_mode = 'ZXY'
             cam.rotation_euler.x = math.radians(90.0)
             cam.rotation_euler.y = 0.0
+        target = find_part(root, "target")
+        if target:
+            target.location = (0.0, 0.0, 0.0)
+        return {'FINISHED'}
+
+
+class CAMRIG_OT_select_part(bpy.types.Operator):
+    """리그 부품 선택"""
+    bl_idname = "camrig.select_part"
+    bl_label = "Select Rig Part"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    part: StringProperty()
+
+    def execute(self, context):
+        root = get_rig_root(context.active_object)
+        if root is None:
+            return {'CANCELLED'}
+        if self.part == "root":
+            obj = root
+        elif self.part == "pivot":
+            obj = get_rig_objects(root)[0]
+        elif self.part == "camera":
+            obj = get_rig_objects(root)[1]
+        else:
+            obj = find_part(root, self.part)
+        if obj is None:
+            self.report({'WARNING'}, "해당 부품이 없습니다")
+            return {'CANCELLED'}
+        for o in context.selected_objects:
+            o.select_set(False)
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
         return {'FINISHED'}
 
 
@@ -292,8 +451,8 @@ class CAMRIG_PT_panel(bpy.types.Panel):
             layout.label(text="리그를 선택하세요", icon='INFO')
             return
 
-        # 구버전(드라이버 방식) 리그는 업그레이드 필요
-        if "orbit" in root.keys():
+        # 구버전 리그는 업그레이드 필요
+        if root.get(ROOT_MARKER, 0) < RIG_VERSION:
             box = layout.box()
             box.label(text="구버전 리그입니다", icon='ERROR')
             box.operator("camrig.upgrade", icon='FILE_REFRESH')
@@ -306,11 +465,28 @@ class CAMRIG_PT_panel(bpy.types.Panel):
         row.operator("camrig.keyframe", text="", icon='KEY_HLT')
         row.operator("camrig.reset_aim", text="", icon='CON_TRACKTO')
 
+        # 부품 빠른 선택
+        row = layout.row(align=True)
+        row.label(text="선택:")
+        row.operator("camrig.select_part", text="Root").part = "root"
+        row.operator("camrig.select_part", text="Cam").part = "camera"
+        row.operator("camrig.select_part", text="Target").part = "target"
+        row.operator("camrig.select_part", text="Focus").part = "focus"
+
         col = layout.column(align=True)
         col.prop(root.camrig, "orbit", slider=True)
         col.prop(root.camrig, "tilt", slider=True)
         col.prop(root.camrig, "bank", slider=True)
         col.prop(root.camrig, "distance", slider=True)
+
+        if cam is None:
+            layout.label(text="카메라가 없습니다", icon='ERROR')
+            return
+
+        # Target 추적 강도
+        con = cam.constraints.get(TRACK_CON_NAME)
+        if con:
+            layout.prop(con, "influence", text="Target Tracking", slider=True)
 
         box = layout.box()
         box.label(text="뷰포트 단축키", icon='VIEW3D')
@@ -318,10 +494,7 @@ class CAMRIG_PT_panel(bpy.types.Panel):
         col.label(text="Root:  G 이동 · R 회전(Orbit) · S 거리")
         col.label(text="Pivot:  R 틸트")
         col.label(text="Camera:  G 거리 · R 뱅크")
-
-        if cam is None:
-            layout.label(text="카메라가 없습니다", icon='ERROR')
-            return
+        col.label(text="Target/Focus:  G 이동")
 
         layout.separator()
         box = layout.box()
@@ -332,7 +505,10 @@ class CAMRIG_PT_panel(bpy.types.Panel):
         box.prop(dof, "use_dof", text="Depth of Field")
         sub = box.column(align=True)
         sub.enabled = dof.use_dof
-        sub.prop(dof, "focus_distance", text="Focus Distance")
+        sub.prop(dof, "focus_object", text="Focus Object")
+        row = sub.row()
+        row.enabled = dof.focus_object is None
+        row.prop(dof, "focus_distance", text="Focus Distance")
         sub.prop(dof, "aperture_fstop", text="F-Stop")
 
 
@@ -343,6 +519,7 @@ classes = (
     CAMRIG_OT_look_through,
     CAMRIG_OT_keyframe,
     CAMRIG_OT_reset_aim,
+    CAMRIG_OT_select_part,
     CAMRIG_PT_panel,
 )
 

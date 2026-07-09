@@ -38,10 +38,16 @@ Blender 4.2 이상에서:
 ## 리그 구조
 
 ```
-CamRig_Root (Empty, 중심점)   ← G: 중심점 이동 / R: Orbit / S: Distance 배율
- └ CamRig_Pivot (Empty)      ← R: Tilt
-    └ CamRig_Camera          ← G: Distance / R: Bank
+CamRig_Root (중심점/마스터)     ← G: 중심점 이동 / R: Orbit / S: Distance 배율
+ ├ CamRig_OrbitPath (궤도 원)  ← 시각 표시 전용 (선택 불가, 거리/틸트 따라 자동 갱신)
+ ├ CamRig_Target (조준점)      ← G로 이동하면 카메라가 따라봄 (Damped Track, 롤 보존)
+ ├ CamRig_Focus (초점)         ← G로 이동하면 DOF 초점이 따라감 (focus object)
+ └ CamRig_Pivot                ← R: Tilt
+    └ CamRig_Camera            ← G: Distance / R: Bank
 ```
+
+- **Target Tracking** 슬라이더로 타깃 추적 강도(constraint influence)를 조절할 수 있다
+- 패널의 **선택** 버튼으로 Root / Cam / Target / Focus를 빠르게 선택
 
 ## 뷰포트 조작 (v1.1.0+)
 
