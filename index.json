@@ -20,7 +20,7 @@
                                   "Camera",
                                   "3D View"
                               ],
-                     "archive_url":  "./camera_orbit_rig-1.3.0.zip",
+                     "archive_url":  "https://github.com/ODZSTUDIO/camera-orbit-rig/releases/download/v1.3.0/camera_orbit_rig-1.3.0.zip",
                      "archive_size":  6654,
                      "archive_hash":  "sha256:d7219c5ec443cc4a72aa52d08603db332ca62bacfa4234cc849844e426250986"
                  }

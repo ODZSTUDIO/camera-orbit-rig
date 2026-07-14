@@ -19,9 +19,14 @@ Blender 4.2 이상에서:
 
 ## 버전 업데이트 방법 (개발자용)
 
+zip은 저장소에 커밋하지 않고 **GitHub Release 첨부파일**로 버전마다 영구 보관한다
+(`index.json`은 항상 최신 버전의 Release 다운로드 URL을 가리킨다). 과거 버전도
+저장소의 [Releases](https://github.com/ODZSTUDIO/camera-orbit-rig/releases) 탭에서
+계속 내려받을 수 있다.
+
 1. `__init__.py` 수정
-2. `blender_manifest.toml`의 `version` 올리기 (예: `1.0.1`)
-3. 빌드:
+2. `blender_manifest.toml`의 `version` 올리기 (예: `1.4.0`)
+3. 빌드 (dist/ 에 zip 생성 + index.json을 Release URL로 갱신):
 
    ```powershell
    powershell -ExecutionPolicy Bypass -File build.ps1
@@ -30,10 +35,17 @@ Blender 4.2 이상에서:
 4. 커밋 & 푸시:
 
    ```powershell
-   git add -A; git commit -m "v1.0.1"; git push
+   git add -A; git commit -m "v1.4.0 ..."; git push
    ```
 
-블렌더가 원격 저장소의 `index.json`을 읽어 업데이트를 감지한다.
+5. 태그 푸시 & Release 생성 (dist/ 의 zip을 그대로 첨부):
+
+   ```powershell
+   git tag v1.4.0; git push origin v1.4.0
+   gh release create v1.4.0 "dist/camera_orbit_rig-1.4.0.zip" --title "v1.4.0" --notes "..."
+   ```
+
+블렌더가 원격 저장소의 `index.json`을 읽어 최신 버전 업데이트를 감지한다.
 
 ## 리그 구조
 
