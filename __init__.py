@@ -8,21 +8,26 @@ from bpy.props import FloatProperty, PointerProperty, StringProperty
 
 # -----------------------------------------------------------------------------
 # 리그 구조
-#   Root (Empty, 중심점/마스터)  - Orbit(Z 회전), 이동(G), 스케일(S)=Distance 배율
-#     ├ OrbitPath (Curve)       - 카메라 궤도 시각 표시 (선택 불가, 드라이버로 자동 갱신)
+#   Root (Empty, 중심점/마스터)  - 이동(G), 스케일(S)=Distance 배율. 회전은 잠금
+#     ├ OrbitPath (Curve)       - Orbit(Z 회전) — 직접 선택해서 돌리는 컨트롤
 #     ├ Target (Empty)          - 카메라 조준점. G로 옮기면 카메라가 따라봄 (Damped Track)
 #     ├ Focus (Empty)           - DOF 초점 오브젝트. G로 옮기면 초점이 따라감
 #     └ Pivot (Empty)           - Tilt(X 회전)
-#         └ Camera              - Distance(-Y 위치), Bank(뷰 축 롤)
+#         └ Camera              - Distance(-Y 위치), 자유 회전(XYZ, Bank=Z)
 #
-# 슬라이더는 오브젝트 트랜스폼을 직접 읽고 쓴다(get/set 프로퍼티).
-# 그래서 뷰포트에서 G/R/S로 움직여도 슬라이더에 그대로 반영되고, 반대도 마찬가지.
-# 리그에 필요 없는 축은 잠가 두어 G/R/S가 정확히 해당 컨트롤만 움직인다.
-# Damped Track은 Track To와 달리 롤을 보존해서 Bank가 그대로 동작한다.
+# OrbitPath를 R로 돌리면 그 Z 회전이 드라이버로 Root에 그대로 전달되어 Orbit이
+# 움직인다(Root 자신의 회전은 잠겨 있고 순수 드라이버 값). 슬라이더는 오브젝트
+# 트랜스폼을 직접 읽고 쓴다(get/set 프로퍼티) — 뷰포트에서 G/R/S로 움직여도
+# 슬라이더에 그대로 반영되고, 반대도 마찬가지. 리그에 필요 없는 축은 잠가 두어
+# G/R/S가 정확히 해당 컨트롤만 움직인다.
+# Camera의 회전은 전부 열려 있지만 Damped Track이 Target을 계속 바라보게
+# 만들기 때문에, Target Tracking 영향력이 1일 때는 X/Y 회전이 거의 상쇄되고
+# Z(Bank)만 항상 반영된다. 영향력을 낮추면 X/Y/Z 모두 완전한 수동 조준이 된다.
 # -----------------------------------------------------------------------------
 
 ROOT_MARKER = "is_camrig_root"
-RIG_VERSION = 3  # 1: 드라이버 방식, 2: 트랜스폼 직접 제어, 3: Target/Focus/궤도 추가
+RIG_VERSION = 4  # 1: 드라이버 방식, 2: 트랜스폼 직접 제어, 3: Target/Focus/궤도,
+                 # 4: OrbitPath 직접 조작 + Camera 자유 회전
 PART_PROP = "camrig_part"
 TRACK_CON_NAME = "CamRig Track"
 
@@ -51,17 +56,30 @@ def get_rig_objects(root):
     return pivot, cam
 
 
-def apply_rig_locks(root, pivot, cam, target=None, focus=None):
+def has_driver(obj, data_path, index=-1):
+    if not obj.animation_data:
+        return False
+    return any(fc.data_path == data_path and (index < 0 or fc.array_index == index)
+               for fc in obj.animation_data.drivers)
+
+
+def apply_rig_locks(root, pivot, cam, target=None, focus=None, path=None):
     """G/R/S가 리그 컨트롤만 움직이도록 불필요한 축 잠금"""
-    # Root: G 이동, R = Orbit(Z만), S = Distance 배율
-    root.lock_rotation = (True, True, False)
+    # Root: G 이동, S = Distance 배율. 회전은 OrbitPath의 드라이버로만 들어옴
+    root.lock_rotation = (True, True, True)
+    # OrbitPath: R = Orbit(Z만) — 직접 잡고 돌리는 컨트롤
+    if path:
+        path.lock_location = (True, True, True)
+        path.lock_rotation = (True, True, False)
+        path.lock_scale = (True, True, True)
     # Pivot: R = Tilt(X만)
     pivot.lock_location = (True, True, True)
     pivot.lock_rotation = (False, True, True)
     pivot.lock_scale = (True, True, True)
-    # Camera: G = Distance(Y만), R = Bank(Z만)
+    # Camera: G = Distance(Y만), R = 자유 회전(XYZ). Bank 슬라이더는 Z를 사용하고,
+    # X/Y는 Target Tracking 영향력을 낮췄을 때 수동 조준용으로 쓴다.
     cam.lock_location = (True, False, True)
-    cam.lock_rotation = (True, True, False)
+    cam.lock_rotation = (False, False, False)
     cam.lock_scale = (True, True, True)
     # Target/Focus: G 이동만
     for obj in (target, focus):
@@ -78,11 +96,16 @@ def _avg_scale(obj):
 # --- 슬라이더 <-> 트랜스폼 양방향 연결 ---------------------------------------
 
 def _get_orbit(self):
-    return math.degrees(self.id_data.rotation_euler.z)
+    path = find_part(self.id_data, "path")
+    return math.degrees(path.rotation_euler.z) if path else math.degrees(self.id_data.rotation_euler.z)
 
 
 def _set_orbit(self, value):
-    self.id_data.rotation_euler.z = math.radians(value)
+    path = find_part(self.id_data, "path")
+    if path:
+        path.rotation_euler.z = math.radians(value)
+    else:
+        self.id_data.rotation_euler.z = math.radians(value)
 
 
 def _get_tilt(self):
@@ -122,7 +145,7 @@ def _set_distance(self, value):
 
 class CamRigSettings(bpy.types.PropertyGroup):
     orbit: FloatProperty(
-        name="Orbit", description="중심점 기준 수평 회전 (도) — 뷰포트에서 Root를 R로 돌려도 됨",
+        name="Orbit", description="중심점 기준 수평 회전 (도) — 뷰포트에서 OrbitPath를 R로 돌려도 됨",
         get=_get_orbit, set=_set_orbit, soft_min=-360.0, soft_max=360.0)
     tilt: FloatProperty(
         name="Tilt", description="카메라 상하 각도 (도) — 뷰포트에서 Pivot을 R로 돌려도 됨",
@@ -186,8 +209,23 @@ def add_orbit_path_drivers(path, pivot, cam):
     make_driver(path.driver_add("location", 2), "cy * sin(px)")
 
 
+def add_orbit_master_driver(root, path):
+    """Root의 Z 회전이 OrbitPath의 Z 회전을 그대로 따라가게 한다.
+    OrbitPath를 직접 잡고 R로 돌려도 Orbit이 반영되도록 하는 연결."""
+    fcurve = root.driver_add("rotation_euler", 2)
+    driver = fcurve.driver
+    driver.type = 'SCRIPTED'
+    var = driver.variables.new()
+    var.name = "o"
+    var.type = 'TRANSFORMS'
+    var.targets[0].id = path
+    var.targets[0].transform_type = 'ROT_Z'
+    var.targets[0].transform_space = 'TRANSFORM_SPACE'
+    driver.expression = "o"
+
+
 def add_rig_extras(context, root, pivot, cam):
-    """Target / Focus / 궤도 원 생성 및 연결 (v3 파트)"""
+    """Target / Focus / 궤도 원 생성 및 연결 (v3+ 파트)"""
     collection = context.collection
 
     # Target: 카메라 조준점
@@ -206,14 +244,15 @@ def add_rig_extras(context, root, pivot, cam):
     focus[PART_PROP] = "focus"
     collection.objects.link(focus)
 
-    # OrbitPath: 시각 표시 전용 궤도 원
+    # OrbitPath: Orbit을 직접 조작하는 궤도 원 (선택 가능)
     path = bpy.data.objects.new("CamRig_OrbitPath", make_orbit_path_curve("CamRig_OrbitPath"))
     path.parent = root
     path[PART_PROP] = "path"
-    path.hide_select = True
     path.hide_render = True
     collection.objects.link(path)
     add_orbit_path_drivers(path, pivot, cam)
+    path.rotation_euler.z = root.rotation_euler.z  # 기존 orbit 값 보존 후 드라이버 연결
+    add_orbit_master_driver(root, path)
 
     # Damped Track: 롤(Bank)을 보존하면서 Target을 바라봄
     con = cam.constraints.new('DAMPED_TRACK')
@@ -266,10 +305,10 @@ class CAMRIG_OT_add(bpy.types.Operator):
         cam.rotation_euler = (math.radians(90.0), 0.0, 0.0)
         collection.objects.link(cam)
 
-        target, focus, _ = add_rig_extras(context, root, pivot, cam)
+        target, focus, path = add_rig_extras(context, root, pivot, cam)
 
         root[ROOT_MARKER] = RIG_VERSION
-        apply_rig_locks(root, pivot, cam, target, focus)
+        apply_rig_locks(root, pivot, cam, target, focus, path)
 
         # 씬 카메라로 지정하고 루트 선택
         context.scene.camera = cam
@@ -321,11 +360,18 @@ class CAMRIG_OT_upgrade(bpy.types.Operator):
         # v2 → v3: Target / Focus / 궤도 원 추가
         target = find_part(root, "target")
         focus = find_part(root, "focus")
-        if target is None or focus is None:
-            target, focus, _ = add_rig_extras(context, root, pivot, cam)
+        path = find_part(root, "path")
+        if target is None or focus is None or path is None:
+            target, focus, path = add_rig_extras(context, root, pivot, cam)
+        elif not has_driver(root, "rotation_euler", 2):
+            # v3 → v4: 기존 OrbitPath를 선택 가능하게 열고, 기존 orbit 값을
+            # 옮긴 뒤 Root가 그 값을 드라이버로 따라가도록 연결한다.
+            path.hide_select = False
+            path.rotation_euler.z = root.rotation_euler.z
+            add_orbit_master_driver(root, path)
 
         root[ROOT_MARKER] = RIG_VERSION
-        apply_rig_locks(root, pivot, cam, target, focus)
+        apply_rig_locks(root, pivot, cam, target, focus, path)
 
         self.report({'INFO'}, "리그 업그레이드 완료")
         return {'FINISHED'}
@@ -469,7 +515,10 @@ class CAMRIG_PT_panel(bpy.types.Panel):
         row = layout.row(align=True)
         row.label(text="선택:")
         row.operator("camrig.select_part", text="Root").part = "root"
+        row.operator("camrig.select_part", text="Path").part = "path"
+        row.operator("camrig.select_part", text="Pivot").part = "pivot"
         row.operator("camrig.select_part", text="Cam").part = "camera"
+        row = layout.row(align=True)
         row.operator("camrig.select_part", text="Target").part = "target"
         row.operator("camrig.select_part", text="Focus").part = "focus"
 
@@ -491,9 +540,10 @@ class CAMRIG_PT_panel(bpy.types.Panel):
         box = layout.box()
         box.label(text="뷰포트 단축키", icon='VIEW3D')
         col = box.column(align=True)
-        col.label(text="Root:  G 이동 · R 회전(Orbit) · S 거리")
+        col.label(text="OrbitPath:  R 오빗")
+        col.label(text="Root:  G 이동 · S 거리")
         col.label(text="Pivot:  R 틸트")
-        col.label(text="Camera:  G 거리 · R 뱅크")
+        col.label(text="Camera:  G 거리 · R 자유 회전(Bank=Z)")
         col.label(text="Target/Focus:  G 이동")
 
         layout.separator()
