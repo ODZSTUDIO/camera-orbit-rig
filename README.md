@@ -50,21 +50,26 @@ zip은 저장소에 커밋하지 않고 **GitHub Release 첨부파일**로 버�
 ## 리그 구조
 
 ```
-CamRig_Root (중심점/마스터)     ← G: 중심점 이동 / S: Distance 배율 (회전은 잠금)
- ├ CamRig_OrbitPath (궤도 원)  ← R: Orbit — 직접 선택해서 돌리는 컨트롤
+📷 CamRig_Root (중심점)        ← G: 중심점 이동 / S: Distance 배율 (회전은 쓰지 않음)
  ├ CamRig_Target (조준점)      ← G로 이동하면 카메라가 따라봄 (Damped Track, 롤 보존)
  ├ CamRig_Focus (초점)         ← G로 이동하면 DOF 초점이 따라감 (focus object)
- └ CamRig_Pivot                ← R: Tilt
-    └ CamRig_Camera            ← G: Distance / R: 자유 회전(XYZ, Bank=Z)
+ └ CamRig_OrbitPath (궤도 원)  ← R: Orbit — Camera의 실제 부모
+    └ CamRig_Camera            ← G(Z만): Tilt / R: 자유 회전(XYZ, Bank=Z)
 ```
 
-- OrbitPath를 R로 돌리면 그 Z 회전이 드라이버로 Root에 전달되어 Orbit이 움직인다
-  (Root 자신의 회전은 잠겨 있고 값은 순수 드라이버로만 들어온다)
-- Camera의 회전은 X/Y/Z 모두 열려 있지만, Damped Track이 계속 Target을 바라보게
-  만들기 때문에 **Target Tracking** 영향력이 1(기본값)일 때는 X/Y 회전이 거의
-  상쇄되고 Z(Bank)만 항상 반영된다. 영향력을 낮추면 X/Y/Z 모두 완전한 수동
-  조준이 된다
-- 패널의 **선택** 버튼으로 Root / Path / Pivot / Cam / Target / Focus를 빠르게 선택
+- Pivot은 없다. OrbitPath가 Camera의 **실제 부모**라서 OrbitPath를 R로 돌리면
+  그 아래 Camera가 그대로 함께 돈다 — 드라이버가 아니라 순수 부모-자식 관계라서
+  의존성 순환(dependency cycle) 걱정 없이 동작한다
+- Camera의 Z 위치 자체가 Tilt다. Camera는 OrbitPath 중심으로부터 항상 일정
+  거리(반지름)를 유지한 채 Z로만 움직이도록 Y 위치가 드라이버로 자동
+  계산된다 — Camera를 잡고 **Z로만 이동(G, Z)**해도 거리는 그대로 유지된 채
+  Tilt만 바뀐다. 기본 Tilt는 0
+- 조준은 Pivot 회전이 아니라 Target을 향한 Damped Track이 항상 담당하므로
+  위치가 바뀌어도 자동으로 다시 조준된다
+- Camera의 회전은 X/Y/Z 모두 열려 있지만, Damped Track 때문에 **Target
+  Tracking** 영향력이 1(기본값)일 때는 X/Y 회전이 거의 상쇄되고 Z(Bank)만
+  항상 반영된다. 영향력을 낮추면 X/Y/Z 모두 완전한 수동 조준이 된다
+- 패널의 **선택** 버튼으로 Root / Path / Cam / Target / Focus를 빠르게 선택
 
 ## 뷰포트 조작 (v1.1.0+)
 

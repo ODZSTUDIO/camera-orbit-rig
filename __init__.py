@@ -8,28 +8,41 @@ from bpy.props import FloatProperty, PointerProperty, StringProperty
 
 # -----------------------------------------------------------------------------
 # 리그 구조
-#   Root (Empty, 중심점/마스터)  - 이동(G), 스케일(S)=Distance 배율. 회전은 잠금
-#     ├ OrbitPath (Curve)       - Orbit(Z 회전) — 직접 선택해서 돌리는 컨트롤
-#     ├ Target (Empty)          - 카메라 조준점. G로 옮기면 카메라가 따라봄 (Damped Track)
-#     ├ Focus (Empty)           - DOF 초점 오브젝트. G로 옮기면 초점이 따라감
-#     └ Pivot (Empty)           - Tilt(X 회전)
-#         └ Camera              - Distance(-Y 위치), 자유 회전(XYZ, Bank=Z)
+#   📷 Root (Empty, 중심점)   - 이동(G), 스케일(S)=Distance 배율. 회전 없음
+#     ├ Target (Empty)        - 카메라 조준점. G로 옮기면 카메라가 따라봄 (Damped Track)
+#     ├ Focus (Empty)         - DOF 초점 오브젝트. G로 옮기면 초점이 따라감
+#     └ OrbitPath (Curve)     - Orbit(Z 회전) — 직접 선택해서 돌리는 컨트롤(마스터)
+#         └ Camera            - G(Z만)=Tilt, 자유 회전(XYZ, Bank=Z)
 #
-# OrbitPath를 R로 돌리면 그 Z 회전이 드라이버로 Root에 그대로 전달되어 Orbit이
-# 움직인다(Root 자신의 회전은 잠겨 있고 순수 드라이버 값). 슬라이더는 오브젝트
-# 트랜스폼을 직접 읽고 쓴다(get/set 프로퍼티) — 뷰포트에서 G/R/S로 움직여도
-# 슬라이더에 그대로 반영되고, 반대도 마찬가지. 리그에 필요 없는 축은 잠가 두어
-# G/R/S가 정확히 해당 컨트롤만 움직인다.
-# Camera의 회전은 전부 열려 있지만 Damped Track이 Target을 계속 바라보게
-# 만들기 때문에, Target Tracking 영향력이 1일 때는 X/Y 회전이 거의 상쇄되고
-# Z(Bank)만 항상 반영된다. 영향력을 낮추면 X/Y/Z 모두 완전한 수동 조준이 된다.
+# OrbitPath가 Camera의 실제 부모라서, OrbitPath를 R로 돌리면 그 아래의
+# Camera가 그대로 함께 돌아간다 — 드라이버 없이 순수 부모-자식 관계라
+# 의존성 순환(dependency cycle)이 생기지 않는다. (Root가 자신의 자식인
+# OrbitPath 회전을 드라이버로 참조하는 이전 방식은 부모가 자식의 트랜스폼에
+# 의존하는 순환을 만들어 실제로는 깨져 있었다.)
+#
+# Pivot은 없다. Camera의 Z 위치 자체가 Tilt다. Camera는 OrbitPath 중심으로
+# 부터 항상 일정 거리(camrig_radius)를 유지한 채 Z로만 움직이도록 Y 위치가
+# 드라이버로 자동 계산된다(Y = -sqrt(radius² - Z²), 이 드라이버는 Camera
+# 자기 자신의 다른 채널만 참조하므로 순환이 없다). 그래서 Camera를 잡고
+# Z로만 이동해도(G, Z) 거리는 그대로 유지되면서 Tilt만 바뀐다. 조준 자체는
+# 회전이 아니라 Target을 향한 Damped Track이 항상 담당하므로, 위치가
+# 바뀌어도 자동으로 다시 조준된다.
+#
+# Camera의 회전은 X/Y/Z 모두 열려 있지만, Damped Track이 Target을 계속
+# 바라보게 만들기 때문에 Target Tracking 영향력이 1(기본값)일 때는 X/Y
+# 회전이 거의 상쇄되고 Z(Bank)만 항상 반영된다. 영향력을 낮추면 X/Y/Z
+# 모두 완전한 수동 조준이 된다.
 # -----------------------------------------------------------------------------
 
 ROOT_MARKER = "is_camrig_root"
-RIG_VERSION = 4  # 1: 드라이버 방식, 2: 트랜스폼 직접 제어, 3: Target/Focus/궤도,
-                 # 4: OrbitPath 직접 조작 + Camera 자유 회전
+RIG_VERSION = 5  # 1: 드라이버 방식, 2: 트랜스폼 직접 제어, 3: Target/Focus/궤도,
+                 # 4: OrbitPath 직접 조작(구버전, 순환 드라이버 버그 있었음),
+                 # 5: Pivot 제거 + OrbitPath가 Camera의 실부모(순환 없음) +
+                 #    Camera의 Z 위치가 곧 Tilt
 PART_PROP = "camrig_part"
 TRACK_CON_NAME = "CamRig Track"
+RADIUS_PROP = "camrig_radius"
+ROOT_ICON = "📷"
 
 BEZIER_CIRCLE_C = 0.5522847498  # 반지름 1 원의 베지어 핸들 길이
 
@@ -47,13 +60,12 @@ def find_part(root, part):
     return next((c for c in root.children_recursive if c.get(PART_PROP) == part), None)
 
 
-def get_rig_objects(root):
-    """(pivot, camera) 반환. 없으면 None"""
+def get_camera(root):
+    """리그 카메라 오브젝트 반환. 없으면 None"""
     cam = find_part(root, "camera")
     if cam is None:
         cam = next((c for c in root.children_recursive if c.type == 'CAMERA'), None)
-    pivot = cam.parent if cam else None
-    return pivot, cam
+    return cam
 
 
 def has_driver(obj, data_path, index=-1):
@@ -63,22 +75,19 @@ def has_driver(obj, data_path, index=-1):
                for fc in obj.animation_data.drivers)
 
 
-def apply_rig_locks(root, pivot, cam, target=None, focus=None, path=None):
+def apply_rig_locks(root, cam, target=None, focus=None, path=None):
     """G/R/S가 리그 컨트롤만 움직이도록 불필요한 축 잠금"""
-    # Root: G 이동, S = Distance 배율. 회전은 OrbitPath의 드라이버로만 들어옴
+    # Root: G 이동, S = Distance 배율. 회전은 쓰지 않는다
     root.lock_rotation = (True, True, True)
-    # OrbitPath: R = Orbit(Z만) — 직접 잡고 돌리는 컨트롤
+    # OrbitPath: R = Orbit(Z만) — Camera의 실부모라 직접 잡고 돌리면 함께 돈다
     if path:
         path.lock_location = (True, True, True)
         path.lock_rotation = (True, True, False)
         path.lock_scale = (True, True, True)
-    # Pivot: R = Tilt(X만)
-    pivot.lock_location = (True, True, True)
-    pivot.lock_rotation = (False, True, True)
-    pivot.lock_scale = (True, True, True)
-    # Camera: G = Distance(Y만), R = 자유 회전(XYZ). Bank 슬라이더는 Z를 사용하고,
-    # X/Y는 Target Tracking 영향력을 낮췄을 때 수동 조준용으로 쓴다.
-    cam.lock_location = (True, False, True)
+    # Camera: G(Z만) = Tilt. Y는 Z와 반지름에서 드라이버로 계산되고, X는 잠금.
+    # R = 자유 회전(XYZ). Bank 슬라이더는 Z를 쓰고, X/Y는 Target Tracking
+    # 영향력을 낮췄을 때 수동 조준용으로 쓴다.
+    cam.lock_location = (True, True, False)
     cam.lock_rotation = (False, False, False)
     cam.lock_scale = (True, True, True)
     # Target/Focus: G 이동만
@@ -97,50 +106,57 @@ def _avg_scale(obj):
 
 def _get_orbit(self):
     path = find_part(self.id_data, "path")
-    return math.degrees(path.rotation_euler.z) if path else math.degrees(self.id_data.rotation_euler.z)
+    return math.degrees(path.rotation_euler.z) if path else 0.0
 
 
 def _set_orbit(self, value):
     path = find_part(self.id_data, "path")
     if path:
         path.rotation_euler.z = math.radians(value)
-    else:
-        self.id_data.rotation_euler.z = math.radians(value)
 
 
 def _get_tilt(self):
-    pivot, _ = get_rig_objects(self.id_data)
-    return math.degrees(-pivot.rotation_euler.x) if pivot else 0.0
+    cam = get_camera(self.id_data)
+    if not cam:
+        return 0.0
+    radius = cam.get(RADIUS_PROP, 0.0)
+    if radius < 1e-6:
+        return 0.0
+    z = max(-radius, min(radius, cam.location.z))
+    return math.degrees(math.asin(z / radius))
 
 
 def _set_tilt(self, value):
-    pivot, _ = get_rig_objects(self.id_data)
-    if pivot:
-        pivot.rotation_euler.x = -math.radians(value)
+    cam = get_camera(self.id_data)
+    if cam:
+        radius = cam.get(RADIUS_PROP, 5.0)
+        cam.location.z = radius * math.sin(math.radians(value))
 
 
 def _get_bank(self):
-    _, cam = get_rig_objects(self.id_data)
+    cam = get_camera(self.id_data)
     return math.degrees(cam.rotation_euler.z) if cam else 0.0
 
 
 def _set_bank(self, value):
-    _, cam = get_rig_objects(self.id_data)
+    cam = get_camera(self.id_data)
     if cam:
         cam.rotation_euler.z = math.radians(value)
 
 
 def _get_distance(self):
     root = self.id_data
-    _, cam = get_rig_objects(root)
-    return -cam.location.y * _avg_scale(root) if cam else 0.0
+    cam = get_camera(root)
+    return cam.get(RADIUS_PROP, 0.0) * _avg_scale(root) if cam else 0.0
 
 
 def _set_distance(self, value):
     root = self.id_data
-    _, cam = get_rig_objects(root)
+    cam = get_camera(root)
     if cam:
-        cam.location.y = -value / _avg_scale(root)
+        radius = max(0.001, value / _avg_scale(root))
+        cam[RADIUS_PROP] = radius
+        cam.location.z = max(-radius, min(radius, cam.location.z))
 
 
 class CamRigSettings(bpy.types.PropertyGroup):
@@ -148,13 +164,13 @@ class CamRigSettings(bpy.types.PropertyGroup):
         name="Orbit", description="중심점 기준 수평 회전 (도) — 뷰포트에서 OrbitPath를 R로 돌려도 됨",
         get=_get_orbit, set=_set_orbit, soft_min=-360.0, soft_max=360.0)
     tilt: FloatProperty(
-        name="Tilt", description="카메라 상하 각도 (도) — 뷰포트에서 Pivot을 R로 돌려도 됨",
+        name="Tilt", description="카메라 상하 각도 (도) — 뷰포트에서 Camera를 G로 Z 이동해도 됨",
         get=_get_tilt, set=_set_tilt, soft_min=-89.0, soft_max=89.0)
     bank: FloatProperty(
         name="Bank", description="뷰 축 기준 롤 (도) — 뷰포트에서 Camera를 R로 돌려도 됨",
         get=_get_bank, set=_set_bank, soft_min=-180.0, soft_max=180.0)
     distance: FloatProperty(
-        name="Distance", description="중심점에서 카메라까지 거리 — Camera를 G로 밀거나 Root를 S로 스케일해도 됨",
+        name="Distance", description="중심점에서 카메라까지 거리 — Root를 S로 스케일해도 됨",
         get=_get_distance, set=_set_distance, min=0.0, soft_max=100.0)
 
 
@@ -184,48 +200,32 @@ def make_orbit_path_curve(name):
     return curve
 
 
-def add_orbit_path_drivers(path, pivot, cam):
-    """궤도 원이 카메라 거리/틸트를 따라가도록 드라이버 연결 (시각 표시 전용)"""
-
-    def make_driver(fcurve, expression):
-        driver = fcurve.driver
-        driver.type = 'SCRIPTED'
-        v = driver.variables.new()
-        v.name = "cy"
-        v.type = 'TRANSFORMS'
-        v.targets[0].id = cam
-        v.targets[0].transform_type = 'LOC_Y'
-        v.targets[0].transform_space = 'TRANSFORM_SPACE'
-        v = driver.variables.new()
-        v.name = "px"
-        v.type = 'TRANSFORMS'
-        v.targets[0].id = pivot
-        v.targets[0].transform_type = 'ROT_X'
-        v.targets[0].transform_space = 'TRANSFORM_SPACE'
-        driver.expression = expression
-
-    for i in range(3):
-        make_driver(path.driver_add("scale", i), "-cy * cos(px)")
-    make_driver(path.driver_add("location", 2), "cy * sin(px)")
-
-
-def add_orbit_master_driver(root, path):
-    """Root의 Z 회전이 OrbitPath의 Z 회전을 그대로 따라가게 한다.
-    OrbitPath를 직접 잡고 R로 돌려도 Orbit이 반영되도록 하는 연결."""
-    fcurve = root.driver_add("rotation_euler", 2)
+def add_camera_radius_driver(cam):
+    """Camera의 Y 위치가 Z 위치 + 저장된 반지름(camrig_radius)에서 자동으로
+    계산되게 한다. 그래서 Camera를 Z로만 움직여도(G, Z) 중심으로부터의
+    거리가 유지된 채 호를 그리며 움직인다 — 이것이 곧 Tilt다. 오브젝트
+    자기 자신의 다른 채널만 참조하므로 순환 의존성이 생기지 않는다."""
+    fcurve = cam.driver_add("location", 1)
     driver = fcurve.driver
     driver.type = 'SCRIPTED'
-    var = driver.variables.new()
-    var.name = "o"
-    var.type = 'TRANSFORMS'
-    var.targets[0].id = path
-    var.targets[0].transform_type = 'ROT_Z'
-    var.targets[0].transform_space = 'TRANSFORM_SPACE'
-    driver.expression = "o"
+    vz = driver.variables.new()
+    vz.name = "z"
+    vz.type = 'TRANSFORMS'
+    vz.targets[0].id = cam
+    vz.targets[0].transform_type = 'LOC_Z'
+    vz.targets[0].transform_space = 'TRANSFORM_SPACE'
+    vr = driver.variables.new()
+    vr.name = "r"
+    vr.type = 'SINGLE_PROP'
+    vr.targets[0].id_type = 'OBJECT'
+    vr.targets[0].id = cam
+    vr.targets[0].data_path = '["%s"]' % RADIUS_PROP
+    driver.expression = "-sqrt(max(r * r - z * z, 0.0001))"
 
 
-def add_rig_extras(context, root, pivot, cam):
-    """Target / Focus / 궤도 원 생성 및 연결 (v3+ 파트)"""
+def add_rig_extras(context, root):
+    """Target / Focus / OrbitPath 생성. Camera는 이 뒤에 만들어 OrbitPath에
+    부모로 지정하고 link_camera_extras()로 마무리한다."""
     collection = context.collection
 
     # Target: 카메라 조준점
@@ -244,28 +244,24 @@ def add_rig_extras(context, root, pivot, cam):
     focus[PART_PROP] = "focus"
     collection.objects.link(focus)
 
-    # OrbitPath: Orbit을 직접 조작하는 궤도 원 (선택 가능)
+    # OrbitPath: Orbit 마스터 겸 Camera의 실부모 (선택 가능)
     path = bpy.data.objects.new("CamRig_OrbitPath", make_orbit_path_curve("CamRig_OrbitPath"))
     path.parent = root
     path[PART_PROP] = "path"
     path.hide_render = True
     collection.objects.link(path)
-    add_orbit_path_drivers(path, pivot, cam)
-    path.rotation_euler.z = root.rotation_euler.z  # 기존 orbit 값 보존 후 드라이버 연결
-    add_orbit_master_driver(root, path)
 
-    # Damped Track: 롤(Bank)을 보존하면서 Target을 바라봄
+    return target, focus, path
+
+
+def link_camera_extras(cam, target, focus):
+    """Damped Track(조준)과 DOF 초점을 연결한다."""
     con = cam.constraints.new('DAMPED_TRACK')
     con.name = TRACK_CON_NAME
     con.target = target
     con.track_axis = 'TRACK_NEGATIVE_Z'
-
-    # DOF 초점을 Focus 엠프티로
     cam.data.dof.focus_object = focus
-
     cam[PART_PROP] = "camera"
-    pivot[PART_PROP] = "pivot"
-    return target, focus, path
 
 
 # --- 오퍼레이터 ---------------------------------------------------------------
@@ -280,35 +276,30 @@ class CAMRIG_OT_add(bpy.types.Operator):
         cursor = context.scene.cursor.location.copy()
         collection = context.collection
 
-        # Root: 중심점/마스터
-        root = bpy.data.objects.new("CamRig_Root", None)
+        # Root: 중심점
+        root = bpy.data.objects.new(ROOT_ICON + " CamRig_Root", None)
         root.empty_display_type = 'SPHERE'
-        root.empty_display_size = 0.35
+        root.empty_display_size = 0.6
         root.location = cursor
         collection.objects.link(root)
 
-        # Pivot: 틸트용
-        pivot = bpy.data.objects.new("CamRig_Pivot", None)
-        pivot.empty_display_type = 'CIRCLE'
-        pivot.empty_display_size = 0.3
-        pivot.parent = root
-        pivot.rotation_euler.x = -math.radians(20.0)  # 기본 틸트 20도
-        collection.objects.link(pivot)
+        target, focus, path = add_rig_extras(context, root)
 
-        # Camera
+        # Camera: OrbitPath의 직속 자식. Z 위치 = Tilt(기본 0), 반지름 = Distance(기본 5)
         cam_data = bpy.data.cameras.new("CamRig_Camera")
         cam = bpy.data.objects.new("CamRig_Camera", cam_data)
-        cam.parent = pivot
-        cam.location = (0.0, -5.0, 0.0)  # 기본 거리 5
+        cam.parent = path
+        cam[RADIUS_PROP] = 5.0
+        cam.location = (0.0, -5.0, 0.0)  # 기본 거리 5, Tilt 0
         # ZXY 오일러: Z(bank)가 먼저 적용되어 뷰 축 기준 순수한 롤이 됨
         cam.rotation_mode = 'ZXY'
         cam.rotation_euler = (math.radians(90.0), 0.0, 0.0)
         collection.objects.link(cam)
-
-        target, focus, path = add_rig_extras(context, root, pivot, cam)
+        add_camera_radius_driver(cam)
+        link_camera_extras(cam, target, focus)
 
         root[ROOT_MARKER] = RIG_VERSION
-        apply_rig_locks(root, pivot, cam, target, focus, path)
+        apply_rig_locks(root, cam, target, focus, path)
 
         # 씬 카메라로 지정하고 루트 선택
         context.scene.camera = cam
@@ -322,7 +313,7 @@ class CAMRIG_OT_add(bpy.types.Operator):
 
 
 class CAMRIG_OT_upgrade(bpy.types.Operator):
-    """구버전 리그를 최신 구조(Target/Focus/궤도 표시)로 변환"""
+    """구버전 리그를 최신 구조(Pivot 제거, OrbitPath가 Camera의 실부모)로 변환"""
     bl_idname = "camrig.upgrade"
     bl_label = "Upgrade Rig"
     bl_options = {'REGISTER', 'UNDO'}
@@ -331,47 +322,88 @@ class CAMRIG_OT_upgrade(bpy.types.Operator):
         root = get_rig_root(context.active_object)
         if root is None:
             return {'CANCELLED'}
-        pivot, cam = get_rig_objects(root)
-        if pivot is None or cam is None:
+        cam = get_camera(root)
+        if cam is None:
             self.report({'WARNING'}, "리그 구조를 찾을 수 없습니다")
             return {'CANCELLED'}
 
-        # v1: 드라이버 방식 → 값을 트랜스폼으로 옮기고 드라이버 제거
+        # v1: 커스텀 프로퍼티 + 드라이버 방식 → 트랜스폼 값으로 변환
         if "orbit" in root.keys():
             orbit = float(root.get("orbit", 0.0))
-            tilt = float(root.get("tilt", 20.0))
+            tilt_deg = float(root.get("tilt", 20.0))
             bank = float(root.get("bank", 0.0))
             distance = float(root.get("distance", 5.0))
-
             root.driver_remove("rotation_euler", 2)
-            pivot.driver_remove("rotation_euler", 0)
+            old_parent = cam.parent
+            if old_parent and old_parent != root:
+                old_parent.driver_remove("rotation_euler", 0)
+                old_parent.rotation_euler.x = -math.radians(tilt_deg)
             cam.driver_remove("location", 1)
             cam.driver_remove("rotation_euler", 2)
-
             root.rotation_euler.z = math.radians(orbit)
-            pivot.rotation_euler.x = -math.radians(tilt)
             cam.location.y = -distance
             cam.rotation_euler.z = math.radians(bank)
-
             for key in ("orbit", "tilt", "bank", "distance"):
                 if key in root.keys():
                     del root[key]
 
-        # v2 → v3: Target / Focus / 궤도 원 추가
+        # v4에 있었던 Root↔OrbitPath 순환 드라이버 제거 (더는 필요 없다 —
+        # 이제 OrbitPath 자신의 회전이 곧 Orbit이고, Root는 회전을 쓰지 않는다)
+        if has_driver(root, "rotation_euler", 2):
+            root.driver_remove("rotation_euler", 2)
+        root.rotation_euler.z = 0.0
+
+        path = find_part(root, "path")
+        # 옛 Pivot(카메라의 부모가 Root도 OrbitPath도 아닌 별도 엠프티였던 경우)
+        pivot = cam.parent if (cam.parent is not None and cam.parent not in (root, path)) else None
+
+        if pivot:
+            old_radius = abs(cam.location.y)
+            old_tilt = -pivot.rotation_euler.x  # 옛 getter와 동일한 부호 규칙
+        else:
+            computed = math.hypot(cam.location.y, cam.location.z)
+            old_radius = computed if computed > 1e-6 else cam.get(RADIUS_PROP, 5.0)
+            old_tilt = math.atan2(cam.location.z, -cam.location.y) if computed > 1e-6 else 0.0
+
         target = find_part(root, "target")
         focus = find_part(root, "focus")
-        path = find_part(root, "path")
         if target is None or focus is None or path is None:
-            target, focus, path = add_rig_extras(context, root, pivot, cam)
-        elif not has_driver(root, "rotation_euler", 2):
-            # v3 → v4: 기존 OrbitPath를 선택 가능하게 열고, 기존 orbit 값을
-            # 옮긴 뒤 Root가 그 값을 드라이버로 따라가도록 연결한다.
+            new_target, new_focus, new_path = add_rig_extras(context, root)
+            target = target or new_target
+            focus = focus or new_focus
+            path = path or new_path
+        else:
             path.hide_select = False
-            path.rotation_euler.z = root.rotation_euler.z
-            add_orbit_master_driver(root, path)
+            if path.animation_data:
+                path.driver_remove("scale")
+                path.driver_remove("location", 2)
+            path.scale = (1.0, 1.0, 1.0)
+            path.location = (0.0, 0.0, 0.0)
+
+        if cam.parent != path:
+            cam.parent = path
+            cam.matrix_parent_inverse.identity()
+            cam.location.x = 0.0
+            cam.location.y = -old_radius * math.cos(old_tilt)
+            cam.location.z = old_radius * math.sin(old_tilt)
+        cam[RADIUS_PROP] = old_radius
+
+        if pivot:
+            bpy.data.objects.remove(pivot, do_unlink=True)
+
+        if not has_driver(cam, "location", 1):
+            add_camera_radius_driver(cam)
+        if not cam.constraints.get(TRACK_CON_NAME):
+            link_camera_extras(cam, target, focus)
+        if cam.data.dof.focus_object is None:
+            cam.data.dof.focus_object = focus
 
         root[ROOT_MARKER] = RIG_VERSION
-        apply_rig_locks(root, pivot, cam, target, focus, path)
+        apply_rig_locks(root, cam, target, focus, path)
+
+        if ROOT_ICON not in root.name:
+            root.name = ROOT_ICON + " " + root.name
+        root.empty_display_size = max(root.empty_display_size, 0.6)
 
         self.report({'INFO'}, "리그 업그레이드 완료")
         return {'FINISHED'}
@@ -384,7 +416,7 @@ class CAMRIG_OT_look_through(bpy.types.Operator):
 
     def execute(self, context):
         root = get_rig_root(context.active_object)
-        cam = get_rig_objects(root)[1] if root else None
+        cam = get_camera(root) if root else None
         if cam is None:
             self.report({'WARNING'}, "리그 카메라를 찾을 수 없습니다")
             return {'CANCELLED'}
@@ -406,15 +438,16 @@ class CAMRIG_OT_keyframe(bpy.types.Operator):
         root = get_rig_root(context.active_object)
         if root is None:
             return {'CANCELLED'}
-        pivot, cam = get_rig_objects(root)
+        cam = get_camera(root)
+        path = find_part(root, "path")
         root.keyframe_insert("location")
-        root.keyframe_insert("rotation_euler", index=2)
         root.keyframe_insert("scale")
-        if pivot:
-            pivot.keyframe_insert("rotation_euler", index=0)
+        if path:
+            path.keyframe_insert("rotation_euler", index=2)
         if cam:
-            cam.keyframe_insert("location", index=1)
-            cam.keyframe_insert("rotation_euler", index=2)
+            cam.keyframe_insert("location", index=2)  # Z = Tilt
+            cam.keyframe_insert("rotation_euler", index=2)  # Bank
+            cam.keyframe_insert('["%s"]' % RADIUS_PROP)  # Distance
         for part in ("target", "focus"):
             obj = find_part(root, part)
             if obj:
@@ -424,7 +457,7 @@ class CAMRIG_OT_keyframe(bpy.types.Operator):
 
 
 class CAMRIG_OT_reset_aim(bpy.types.Operator):
-    """Target을 중심점으로 되돌리고 카메라 조준 축을 정리 (Bank는 유지)"""
+    """Target을 중심점으로 되돌리고 카메라의 수동 조준 회전을 정리 (Bank는 유지)"""
     bl_idname = "camrig.reset_aim"
     bl_label = "Reset Aim"
     bl_options = {'REGISTER', 'UNDO'}
@@ -433,14 +466,9 @@ class CAMRIG_OT_reset_aim(bpy.types.Operator):
         root = get_rig_root(context.active_object)
         if root is None:
             return {'CANCELLED'}
-        pivot, cam = get_rig_objects(root)
-        if pivot:
-            pivot.location = (0.0, 0.0, 0.0)
-            pivot.rotation_euler.y = 0.0
-            pivot.rotation_euler.z = 0.0
+        cam = get_camera(root)
         if cam:
             cam.location.x = 0.0
-            cam.location.z = 0.0
             cam.rotation_mode = 'ZXY'
             cam.rotation_euler.x = math.radians(90.0)
             cam.rotation_euler.y = 0.0
@@ -464,10 +492,8 @@ class CAMRIG_OT_select_part(bpy.types.Operator):
             return {'CANCELLED'}
         if self.part == "root":
             obj = root
-        elif self.part == "pivot":
-            obj = get_rig_objects(root)[0]
         elif self.part == "camera":
-            obj = get_rig_objects(root)[1]
+            obj = get_camera(root)
         else:
             obj = find_part(root, self.part)
         if obj is None:
@@ -504,7 +530,7 @@ class CAMRIG_PT_panel(bpy.types.Panel):
             box.operator("camrig.upgrade", icon='FILE_REFRESH')
             return
 
-        pivot, cam = get_rig_objects(root)
+        cam = get_camera(root)
 
         row = layout.row(align=True)
         row.operator("camrig.look_through", text="Look Through", icon='VIEW_CAMERA')
@@ -516,7 +542,6 @@ class CAMRIG_PT_panel(bpy.types.Panel):
         row.label(text="선택:")
         row.operator("camrig.select_part", text="Root").part = "root"
         row.operator("camrig.select_part", text="Path").part = "path"
-        row.operator("camrig.select_part", text="Pivot").part = "pivot"
         row.operator("camrig.select_part", text="Cam").part = "camera"
         row = layout.row(align=True)
         row.operator("camrig.select_part", text="Target").part = "target"
@@ -540,10 +565,9 @@ class CAMRIG_PT_panel(bpy.types.Panel):
         box = layout.box()
         box.label(text="뷰포트 단축키", icon='VIEW3D')
         col = box.column(align=True)
-        col.label(text="OrbitPath:  R 오빗")
+        col.label(text="OrbitPath:  R 오빗 (Camera가 함께 돎)")
         col.label(text="Root:  G 이동 · S 거리")
-        col.label(text="Pivot:  R 틸트")
-        col.label(text="Camera:  G 거리 · R 자유 회전(Bank=Z)")
+        col.label(text="Camera:  G(Z만) 틸트 · R 자유 회전(Bank=Z)")
         col.label(text="Target/Focus:  G 이동")
 
         layout.separator()
